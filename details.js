@@ -35,32 +35,55 @@ async function initAuth() {
 }
 // ==================== 图片上传【改造：先压缩再上传】 ====================
 function uploadImages(files) { return ForumUI.uploadFiles(files); }
-const previewUrls = new Map();
+// Per reply: one entry per image. Restored drafts carry {url}; a freshly picked
+// local file carries {file, preview} and gets its url only after upload.
+const replyImages = new Map();
 function releasePreviews(id) {
-    for (const url of previewUrls.get(id) || []) URL.revokeObjectURL(url);
-    previewUrls.delete(id);
+    for (const image of replyImages.get(id) || []) {
+        if (image.preview) URL.revokeObjectURL(image.preview);
+    }
+    replyImages.delete(id);
+}
+function renderPreviews(id) {
+    const box = document.getElementById(`preview-${id}`);
+    if (!box) return;
+    box.replaceChildren();
+    for (const image of replyImages.get(id) || []) {
+        const img = document.createElement('img');
+        img.className = 'preview-image-item';
+        img.src = image.preview || image.url;
+        img.alt = '回复图片';
+        box.appendChild(img);
+    }
+}
+function saveReplyImageDraft(id) {
+    const text = document.querySelector(`#reply-box-${id} textarea`)?.value || '';
+    const anon = document.querySelector(`#reply-box-${id} input[type=checkbox]`)?.checked || false;
+    ForumDrafts.save('reply-' + id, {
+        text, anonymous: anon,
+        attachments: (replyImages.get(id) || []).map(image => image.url).filter(Boolean)
+    });
 }
 function previewImages(id) {
     const input = document.getElementById(`imageUpload-${id}`);
-    const text = document.querySelector(`#reply-box-${id} textarea`)?.value || '';
-    ForumDrafts.save('reply-' + id, { text, attachments: [] });
-    const box = document.getElementById(`preview-${id}`);
-    releasePreviews(id);
-    box.replaceChildren();
-    const files = Array.from(input.files);
-    if (files.length > 5 || files.some(file => !file.type.startsWith('image/') || file.size > 5 * 1024 * 1024)) {
-        input.value = '';
-        notify('最多选择 5 张图片，每张不超过 5MB', 'error');
-        return;
+    const selected = Array.from(input.files);
+    input.value = '';
+    if (!selected.length) return;
+    const images = replyImages.get(id) || [];
+    const originalLength = images.length;
+    const errors = [];
+    for (const file of selected) {
+        if (!file.type.startsWith('image/')) errors.push('仅支持图片文件');
+        else if (file.size > 5 * 1024 * 1024) errors.push('每张图片不超过 5MB');
+        else if (images.length >= 5) errors.push('最多选择 5 张图片');
+        else images.push({ file, preview: URL.createObjectURL(file) });
     }
-    const urls = files.map(file => URL.createObjectURL(file));
-    previewUrls.set(id, urls);
-    for (const url of urls) {
-        const image = document.createElement('img');
-        image.className = 'preview-image-item';
-        image.src = url;
-        box.appendChild(image);
+    if (images.length !== originalLength) {
+        replyImages.set(id, images);
+        renderPreviews(id);
+        saveReplyImageDraft(id);
     }
+    if (errors.length) notify(errors[0], 'error');
 }
 // ==================== 加载内容 ====================
 const messageIdPattern = /^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
@@ -237,7 +260,6 @@ function observeMoreComments() {
 }
 // ==================== 评论框 ====================
 function closeAllCommentBoxes() {
-    for (const id of previewUrls.keys()) releasePreviews(id);
     document.querySelectorAll('.comment-input-container').forEach(e => e.style.display = 'none');
 }
 function bindReplyDraft(tid, box) {
@@ -248,16 +270,12 @@ function bindReplyDraft(tid, box) {
     if (draft) {
         text.value = draft.text;
         anon.checked = draft.anonymous === true;
-        const preview = document.getElementById('preview-' + tid);
-        for (const src of draft.attachments || []) {
-            const img = document.createElement('img');
-            img.className = 'preview-image-item';
-            img.src = src;
-            img.alt = '已上传的图片';
-            preview.append(img);
+        if (!replyImages.has(tid) && draft.attachments?.length) {
+            replyImages.set(tid, draft.attachments.map(url => ({ url })));
         }
     }
-    const save = () => ForumDrafts.save(key, { text: text.value, anonymous: anon.checked });
+    renderPreviews(tid);
+    const save = () => saveReplyImageDraft(tid);
     const counter = box.querySelector('.reply-count');
     const updateCount = () => { counter.textContent = text.value.length + ' / 1000'; };
     updateCount();
@@ -265,6 +283,7 @@ function bindReplyDraft(tid, box) {
     anon.onchange = save;
     box.querySelector('.cancel-comment-btn').onclick = () => {
         ForumDrafts.clear(key);
+        releasePreviews(tid);
         closeAllCommentBoxes();
     };
 }
@@ -326,17 +345,19 @@ async function submitComment(rid, type) {
     try {
         await authReady;
         if (!currentUser || !currentUser.id) return RootedVoxAuth.handleLogin('/details' + location.search);
-        const el = type === 'main'
-            ? document.getElementById('mainCommentInput')
-            : document.getElementById(`replyInput-${rid}`);
+        const editorId = type === 'main' ? 'mainCommentInput' : `replyInput-${rid}`;
+        const el = document.getElementById(editorId);
         const content = el?.value.trim();
         if (!content) { notify('内容不能为空', 'error'); el?.focus(); return; }
         if (content.length > 1000) { notify('回复最多 1000 字，请缩短后再发布。', 'error'); el.focus(); return; }
         const ano = document.getElementById(`anonymous-${rid}`)?.checked || false;
-        const files = document.getElementById(`imageUpload-${rid}`)?.files;
         const key = 'reply-' + rid;
         const original = ForumDrafts.get(key);
-        const urls = files?.length ? await uploadImages(files, rid) : original?.attachments || [];
+        const images = (replyImages.get(rid) || []).slice();
+        const pending = images.filter(image => !image.url);
+        const uploaded = pending.length ? await uploadImages(pending.map(image => image.file)) : [];
+        pending.forEach((image, index) => { image.url = uploaded[index]; });
+        const urls = images.map(image => image.url).filter(Boolean);
         const payload = { content, anonymous: ano, imageUrls: urls, replyTo: rid };
         const submitted = ForumDrafts.prepare(key, original, payload);
         const response = await request('/api/messages', {
@@ -349,12 +370,13 @@ async function submitComment(rid, type) {
         notify('发布成功，审核通过后会公开。', 'success');
         if (!submitted || ForumDrafts.get(key) !== submitted) return;
         ForumDrafts.clear(key);
-        if (!el.isConnected) return;
-        el.value = '';
+        releasePreviews(rid);
+        const editor = document.getElementById(editorId);
+        if (!editor) return;
+        editor.value = '';
         const input = document.getElementById(`imageUpload-${rid}`);
         if (input) input.value = '';
         document.getElementById(`preview-${rid}`)?.replaceChildren();
-        releasePreviews(rid);
         document.getElementById('reply-box-' + rid).style.display = 'none';
     } catch (error) {
         if (error.message === 'login_required') {

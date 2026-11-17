@@ -100,47 +100,36 @@
       });
   }
 
-  function compressImage(file, options = {}) {
-      return new Promise((resolve, reject) => {
-          if (!file.type.startsWith('image/')) {
-              return resolve(file);
-          }
-          const defaultOpts = {
-              maxWidth: 1920,
-              maxHeight: 1080,
-              quality: 0.6,
-              mimeType: "image/webp"
-          };
-          const opts = { ...defaultOpts, ...options };
-          const source = URL.createObjectURL(file);
-          const img = new Image();
-          img.onload = () => {
-              URL.revokeObjectURL(source);
-              let width = img.width;
-              let height = img.height;
-              const scaleRatio = Math.min(opts.maxWidth / width, opts.maxHeight / height);
-              if (scaleRatio < 1) {
-                  width = width * scaleRatio;
-                  height = height * scaleRatio;
-              }
-              const canvas = document.createElement("canvas");
-              canvas.width = width;
-              canvas.height = height;
-              const ctx = canvas.getContext("2d");
-              ctx.drawImage(img, 0, 0, width, height);
-              canvas.toBlob(blob => {
-                  if (!blob) return reject("图片压缩失败");
-                  const suffixes = { "image/webp": ".webp", "image/png": ".png", "image/jpeg": ".jpg" };
-                  const suffix = suffixes[blob.type];
-                  if (!suffix) return reject(new Error("图片格式不受支持"));
-                  const newFileName = file.name.replace(/(\.\w+)$/, suffix);
-                  const compressedFile = new File([blob], newFileName, { type: blob.type });
-                  resolve(compressedFile);
-              }, opts.mimeType, opts.quality);
-          };
-          img.onerror = () => { URL.revokeObjectURL(source); reject(new Error("图片加载失败")); };
-          img.src = source;
-      });
+  async function compressImage(file, options = {}) {
+      if (!file.type.startsWith('image/')) return file;
+      const { maxWidth = 1920, maxHeight = 1080, quality = 0.6, mimeType = 'image/webp' } = options;
+      const source = URL.createObjectURL(file);
+      const img = new Image();
+      try {
+          await new Promise((resolve, reject) => {
+              img.onload = resolve;
+              img.onerror = () => reject(new Error('图片加载失败'));
+              img.src = source;
+          });
+      } finally {
+          URL.revokeObjectURL(source);
+      }
+
+      const scale = Math.min(1, maxWidth / img.width, maxHeight / img.height);
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('图片压缩失败');
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const encode = (type, quality) => new Promise(done => canvas.toBlob(done, type, quality));
+      const blob = await encode(mimeType, quality);
+      if (!blob) throw new Error("图片压缩失败");
+      const suffixes = { "image/webp": ".webp", "image/png": ".png", "image/jpeg": ".jpg" };
+      const suffix = suffixes[blob.type];
+      if (!suffix) throw new Error("图片格式不受支持");
+      const newFileName = file.name.replace(/(\.\w+)$/, suffix);
+      return new File([blob], newFileName, { type: blob.type });
   }
 
   const uploads = new WeakMap();
